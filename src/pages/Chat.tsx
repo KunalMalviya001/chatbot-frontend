@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useRef, type KeyboardEvent } from "react";
-import { api, setAuthToken } from "../api";
+import { api, setAuthToken, refreshToken } from "../api";
 import { useNavigate } from "react-router-dom";
-import { FiSend } from "react-icons/fi";
+import { FiSend, FiPlus, FiTrash2 } from "react-icons/fi";
+
+/* ================= TYPES ================= */
 
 interface ChatMessage {
   text: string;
@@ -10,233 +12,467 @@ interface ChatMessage {
   createdAt?: string;
 }
 
+interface ChatSession {
+  id: string;
+  title?: string;
+  createdAt: string;
+}
+
+/* ================= COMPONENT ================= */
+
 const Chat: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState<string>("");
+  const [input, setInput] = useState("");
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+
   const navigate = useNavigate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Auto scroll to bottom
+  /* ================= AUTO SCROLL ================= */
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Check auth token, set it, and fetch chat history
+  /* ================= AUTH & FETCH SESSIONS ================= */
   useEffect(() => {
-    const token = localStorage.getItem("access_token");
-    if (!token) {
-      navigate("/");
-      return;
-    }
+    const initAuth = async () => {
+      const token = localStorage.getItem("access_token");
 
-    setAuthToken(token); // set Bearer token for all requests
+      if (!token) {
+        navigate("/");
+        return;
+      }
 
-    const fetchChatHistory = async () => {
+      setAuthToken(token);
+
       try {
-        const res = await api.get("/chat"); // GET chat history
-        // console.log("API response:", res.data);
-
+        const res = await api.get("/chat/history");
         if (Array.isArray(res.data)) {
-          // Transform API response into ChatMessage[]
-          const history: ChatMessage[] = res.data
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .flatMap((item: any) => {
-              const msgs: ChatMessage[] = [];
-              if (item.user_message)
-                msgs.push({ text: item.user_message, from: "user", createdAt: item.createdAt });
-              if (item.bot_message)
-                msgs.push({ text: item.bot_message, from: "bot", createdAt: item.createdAt });
-              return msgs;
-            })
-            .sort((a: ChatMessage, b: ChatMessage) => {
-              // Sort chronologically
-              const aTime = new Date(a.createdAt || 0).getTime();
-              const bTime = new Date(b.createdAt || 0).getTime();
-              return aTime - bTime;
-            });
-
-          setMessages(history);
-        } else {
-          console.warn("Unexpected chat history format", res.data);
+          setSessions(res.data);
+          if (res.data.length > 0) {
+            setActiveSessionId(res.data[0]  );
+          }
         }
-      } catch (err) {
-        console.error("Failed to fetch chat history:", err);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (err: any) {
+        if (err.response?.status === 401) {
+          const newToken = await refreshToken();
+          if (newToken) {
+            setAuthToken(newToken);
+            try {
+              const retryRes = await api.get("/chat/history");
+              if (Array.isArray(retryRes.data)) {
+                setSessions(retryRes.data);
+                if (retryRes.data.length > 0) {
+                  setActiveSessionId(retryRes.data[0]);
+                }
+              }
+            } catch (err) {
+              console.error("Retry failed after token refresh", err);
+              navigate("/");
+            }
+          } else {
+            localStorage.removeItem("access_token");
+            localStorage.removeItem("refresh_token");
+            navigate("/");
+          }
+        } else {
+          console.error("Failed to fetch sessions", err);
+        }
       }
     };
 
-    fetchChatHistory();
+    initAuth();
   }, [navigate]);
 
-  // Send message to backend
-  const sendMessage = async () => {
-    if (!input.trim()) return;
+  /* ================= FETCH CHAT MESSAGES ================= */
+  useEffect(() => {
+    if (!activeSessionId) return;
 
-    // 1️⃣ Add user message
-    const userMessage: ChatMessage = { text: input, from: "user", createdAt: new Date().toISOString() };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMessages([]); // Clear old messages when session changes
 
-    // 2️⃣ Add typing indicator
-    const typingMessage: ChatMessage = { text: "Typing...", from: "bot", isTyping: true };
-    setMessages((prev) => [...prev, typingMessage]);
+    const fetchChat = async () => {
+      try {
+        const res = await api.get(`/chat/history/${activeSessionId}`);
+        if (!Array.isArray(res.data)) return;
+
+        const history: ChatMessage[] = res.data.flatMap((item: any) => {
+          const msgs: ChatMessage[] = [];
+          if (item.user_message)
+            msgs.push({
+              text: item.user_message,
+              from: "user",
+              createdAt: item.createdAt,
+            });
+          if (item.bot_message)
+            msgs.push({
+              text: item.bot_message,
+              from: "bot",
+              createdAt: item.createdAt,
+            });
+          return msgs;
+        });
+
+        setMessages(history);
+
+        // Auto rename session title based on first user message
+        if (history.length && history[0].from === "user") {
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id === activeSessionId
+                ? { ...s, title: history[0].text }
+                : s
+            )
+          );
+        }
+      } catch (err) {
+        console.error("Failed to fetch chat", err);
+      }
+    };
+
+    fetchChat();
+  }, [activeSessionId]);
+
+  /* ================= NEW CHAT SESSION ================= */
+  const createNewSession = async () => {
+    try {
+      const res = await api.post("/chat/createSession", null, {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+        },
+      });
+
+      setSessions((prev) => [res.data, ...prev]);
+      setActiveSessionId(res.data.id);
+      setMessages([]);
+    } catch (err) {
+      console.error("Failed to create session", err);
+    }
+  };
+
+  /* ================= DELETE SESSION ================= */
+  const deleteSession = async (sessionId: string) => {
+    if (!window.confirm("Are you sure you want to delete this chat session?")) return;
 
     try {
-      const res = await api.post("/chat", { message: input });
+      await api.delete(`/chat/history/${sessionId}`, {
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+        },
+      });
 
-      // 3️⃣ Replace typing indicator with bot response
-      const botMessage: ChatMessage = {
-        text: res.data.reply,
-        from: "bot",
-        createdAt: new Date().toISOString(),
-      };
+      setSessions((prev) => prev.filter((s) => s !== sessionId));
 
-      setMessages((prev) => [...prev.filter((m) => !m.isTyping), botMessage]);
+      if (activeSessionId === sessionId) {
+        const remainingSessions = sessions.filter((s) => s !== sessionId);
+        if (remainingSessions.length > 0) {
+          setActiveSessionId(remainingSessions[0]);
+        } else {
+          setActiveSessionId(null);
+          setMessages([]);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to delete session", err);
+    }
+  };
+
+  /* ================= SEND MESSAGE ================= */
+  const sendMessage = async () => {
+    if (!input.trim() || !activeSessionId) return;
+
+    const userMsg: ChatMessage = {
+      text: input,
+      from: "user",
+      createdAt: new Date().toISOString(),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    setInput("");
+
+    // Add typing indicator
+    setMessages((prev) => [
+      ...prev,
+      { text: "Typing...", from: "bot", isTyping: true },
+    ]);
+
+    try {
+      const res = await api.post("/chat", {
+        message: input,
+        id: activeSessionId,
+      });
+
+      setMessages((prev) => [
+        ...prev.filter((m) => !m.isTyping),
+        {
+          text: res.data.reply,
+          from: "bot",
+          createdAt: new Date().toISOString(),
+        },
+      ]);
     } catch {
       setMessages((prev) => [
         ...prev.filter((m) => !m.isTyping),
-        { text: "Error sending message", from: "bot", createdAt: new Date().toISOString() },
+        {
+          text: "Error sending message",
+          from: "bot",
+          createdAt: new Date().toISOString(),
+        },
       ]);
     }
   };
 
+  /* ================= UTILS ================= */
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") sendMessage();
   };
 
   const handleLogout = () => {
     localStorage.removeItem("access_token");
-    setAuthToken(null); // remove token from axios headers
+    localStorage.removeItem("refresh_token");
+    setAuthToken(null);
     navigate("/");
   };
 
-  const formatTime = (isoString?: string) => {
-    if (!isoString) return "";
-    const date = new Date(isoString);
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  };
-
+  /* ================= RENDER ================= */
   return (
-    <div style={styles.container}>
-      <div style={styles.header}>
-        <h2>Chat Bot</h2>
-        <button style={styles.logout} onClick={handleLogout}>
-          Logout
+    <div style={styles.layout}>
+      {/* ===== SIDEBAR ===== */}
+      <aside style={styles.sidebar}>
+        <button style={styles.newChatBtn} onClick={createNewSession}>
+          <FiPlus size={16} /> New chat
         </button>
-      </div>
 
-      <div style={styles.chatBox}>
-        {messages.map((msg, idx) => (
-          <div
-            key={idx}
-            style={{
-              ...styles.message,
-              alignSelf: msg.from === "user" ? "flex-end" : "flex-start",
-              background: msg.from === "user" ? "#4f46e5" : "#e5e5ea",
-              color: msg.from === "user" ? "#fff" : "#000",
-              fontStyle: msg.isTyping ? "italic" : "normal",
-              opacity: msg.isTyping ? 0.7 : 1,
-            }}
-          >
-            <div>{msg.text}</div>
-            {msg.createdAt && (
-              <div style={{ fontSize: "10px", marginTop: "2px", textAlign: "right", opacity: 0.6 }}>
-                {formatTime(msg.createdAt)}
-              </div>
-            )}
-          </div>
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
+        <div style={styles.sessionList}>
+          {sessions.map((s) => (
+            <div
+              key={s}
+              style={{
+                ...styles.sessionItem,
+                background: s === activeSessionId ? "#343541" : "transparent",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span
+                style={{ cursor: "pointer", flex: 1 }}
+                onClick={() => {
+                  if (s !== activeSessionId) {
+                    setMessages([]);
+                    setActiveSessionId(s);
+                  }
+                }}
+              >
+                {s.title || "New chat"}
+              </span>
 
-      <div style={styles.inputContainer}>
-        <input
-          type="text"
-          placeholder="Type a message..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          style={styles.input}
-        />
-        <button onClick={sendMessage} style={styles.sendButton}>
-          <FiSend size={20} />
-        </button>
-      </div>
+              <button
+                onClick={() => deleteSession(s)}
+                style={styles.deleteButton}
+              >
+                <FiTrash2 />
+              </button>
+            </div>
+          ))}
+        </div>
+      </aside>
+
+      {/* ===== CHAT AREA ===== */}
+      <main style={styles.container}>
+        <header style={styles.header}>
+          <h3>Chat</h3>
+          <button style={styles.logout} onClick={handleLogout}>
+            Logout
+          </button>
+        </header>
+
+        <section style={styles.chatBox}>
+          {messages.map((msg, i) => (
+            <div
+              key={i}
+              style={{
+                ...styles.message,
+                alignSelf: msg.from === "user" ? "flex-end" : "flex-start",
+                background: msg.from === "user" ? "#4f46e5" : "#e5e5ea",
+                color: msg.from === "user" ? "#fff" : "#000",
+                fontStyle: msg.isTyping ? "italic" : "normal",
+                opacity: msg.isTyping ? 0.7 : 1,
+              }}
+            >
+              <div>{msg.text}</div>
+              {msg.createdAt && (
+                <div
+                  style={{
+                    fontSize: "10px",
+                    marginTop: "2px",
+                    textAlign: "right",
+                    opacity: 0.6,
+                  }}
+                >
+                  {new Date(msg.createdAt).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </div>
+              )}
+            </div>
+          ))}
+          <div ref={messagesEndRef} />
+        </section>
+
+        <footer style={styles.inputContainer}>
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Send a message..."
+            style={styles.input}
+          />
+          <button onClick={sendMessage} style={styles.sendButton}>
+            <FiSend />
+          </button>
+        </footer>
+      </main>
     </div>
   );
 };
 
+/* ================= STYLES ================= */
+
 const styles: { [key: string]: React.CSSProperties } = {
-  container: {
-    maxWidth: "600px",
-    margin: "50px auto",
+  layout: {
+    display: "flex",
+    height: "100vh",
+    fontFamily: "'Inter', sans-serif",
+    background: "#1f1f2e",
+    color: "#fff",
+  },
+
+  /* ===== SIDEBAR ===== */
+  sidebar: {
+    width: "280px",
+    background: "linear-gradient(180deg, #2c2c3e, #1a1a28)",
+    padding: "15px",
     display: "flex",
     flexDirection: "column",
-    height: "80vh",
-    border: "1px solid #ccc",
+    boxShadow: "2px 0 10px rgba(0,0,0,0.3)",
+    borderRight: "1px solid #333",
+  },
+  newChatBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+    padding: "12px",
     borderRadius: "12px",
+    border: "none",
+    background: "linear-gradient(90deg, #6c5ce7, #a29bfe)",
+    color: "#fff",
+    fontWeight: 500,
+    cursor: "pointer",
+    marginBottom: "15px",
+    transition: "transform 0.2s",
+  },
+  sessionList: {
+    overflowY: "auto",
+    flex: 1,
+    marginTop: "10px",
+  },
+  sessionItem: {
+    padding: "12px 15px",
+    borderRadius: "10px",
+    cursor: "pointer",
+    fontSize: "14px",
+    whiteSpace: "nowrap",
     overflow: "hidden",
-    background: "#fff",
-    boxShadow: "0 4px 20px rgba(0,0,0,0.1)",
+    textOverflow: "ellipsis",
+    marginBottom: "8px",
+    transition: "all 0.2s",
+  },
+  deleteButton: {
+    background: "transparent",
+    border: "none",
+    color: "#ff6b6b",
+    cursor: "pointer",
+    fontWeight: "bold",
+    marginLeft: "8px",
+    display: "flex",
+    alignItems: "center",
+  },
+
+  /* ===== CHAT AREA ===== */
+  container: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    background: "#f5f6fa",
   },
   header: {
+    padding: "16px",
+    background: "#fff",
+    borderBottom: "1px solid #ddd",
     display: "flex",
     justifyContent: "space-between",
     alignItems: "center",
-    padding: "15px",
-    background: "#4f46e5",
-    color: "#fff",
+    fontWeight: 600,
+    fontSize: "18px",
+    boxShadow: "0 2px 4px rgba(0,0,0,0.05)",
   },
   logout: {
-    padding: "8px 12px",
     border: "none",
+    background: "#ef4444",
+    color: "#fff",
+    padding: "8px 16px",
     borderRadius: "8px",
-    background: "#fff",
-    color: "#4f46e5",
     cursor: "pointer",
-    fontWeight: "bold",
+    fontWeight: 500,
+    transition: "background 0.2s",
   },
   chatBox: {
     flex: 1,
-    padding: "15px",
+    padding: "20px",
     display: "flex",
     flexDirection: "column",
-    gap: "10px",
+    gap: "12px",
     overflowY: "auto",
-    background: "#f0f2f5",
+    background: "#e8e8f0",
   },
   message: {
-    padding: "10px 15px",
+    padding: "12px 18px",
     borderRadius: "20px",
     maxWidth: "70%",
-    wordBreak: "break-word",
-    transition: "all 0.3s",
+    wordWrap: "break-word",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.1)",
   },
   inputContainer: {
     display: "flex",
-    padding: "10px",
-    borderTop: "1px solid #ccc",
+    padding: "14px 16px",
     background: "#fff",
+    borderTop: "1px solid #ddd",
   },
   input: {
     flex: 1,
-    padding: "12px 15px",
-    borderRadius: "20px",
+    padding: "14px 18px",
+    borderRadius: "25px",
     border: "1px solid #ccc",
     outline: "none",
-    fontSize: "16px",
+    fontSize: "14px",
+    transition: "border-color 0.2s",
   },
   sendButton: {
-    marginLeft: "10px",
-    padding: "12px 16px",
+    marginLeft: "12px",
+    padding: "14px",
     borderRadius: "50%",
     border: "none",
-    background: "#4f46e5",
+    background: "linear-gradient(135deg, #6c5ce7, #a29bfe)",
     color: "#fff",
-    fontSize: "16px",
     cursor: "pointer",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
+    transition: "transform 0.2s",
   },
 };
 
