@@ -13,9 +13,10 @@ interface ChatMessage {
 }
 
 interface ChatSession {
-  id: string;
+  _id: string;
   title?: string;
   createdAt: string;
+  chat_history?: { user_message?: string; bot_message?: string }[];
 }
 
 /* ================= COMPONENT ================= */
@@ -38,7 +39,6 @@ const Chat: React.FC = () => {
   useEffect(() => {
     const initAuth = async () => {
       const token = localStorage.getItem("access_token");
-
       if (!token) {
         navigate("/");
         return;
@@ -50,35 +50,30 @@ const Chat: React.FC = () => {
         const res = await api.get("/chat/history");
         if (Array.isArray(res.data)) {
           setSessions(res.data);
-          if (res.data.length > 0) {
-            setActiveSessionId(res.data[0]  );
+          
+          // Retrieve the active session ID from localStorage on page load
+          const storedSessionId = localStorage.getItem("activeSessionId");
+          if (storedSessionId) {
+            setActiveSessionId(storedSessionId);
+          } else if (res.data.length > 0) {
+            // If no stored session, default to the first session
+            setActiveSessionId(res.data[0]._id);
           }
         }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (err: any) {
         if (err.response?.status === 401) {
           const newToken = await refreshToken();
           if (newToken) {
             setAuthToken(newToken);
-            try {
-              const retryRes = await api.get("/chat/history");
-              if (Array.isArray(retryRes.data)) {
-                setSessions(retryRes.data);
-                if (retryRes.data.length > 0) {
-                  setActiveSessionId(retryRes.data[0]);
-                }
-              }
-            } catch (err) {
-              console.error("Retry failed after token refresh", err);
-              navigate("/");
+            const retryRes = await api.get("/chat/history");
+            if (Array.isArray(retryRes.data)) {
+              setSessions(retryRes.data);
             }
           } else {
             localStorage.removeItem("access_token");
             localStorage.removeItem("refresh_token");
             navigate("/");
           }
-        } else {
-          console.error("Failed to fetch sessions", err);
         }
       }
     };
@@ -86,96 +81,72 @@ const Chat: React.FC = () => {
     initAuth();
   }, [navigate]);
 
-  /* ================= FETCH CHAT MESSAGES ================= */
+  /* ================= FETCH CHAT + SESSIONS ================= */
   useEffect(() => {
-    if (!activeSessionId) return;
-
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setMessages([]); // Clear old messages when session changes
-
     const fetchChat = async () => {
-      try {
-        const res = await api.get(`/chat/history/${activeSessionId}`);
-        if (!Array.isArray(res.data)) return;
+      if (!activeSessionId) return;
 
-        const history: ChatMessage[] = res.data.flatMap((item: any) => {
-          const msgs: ChatMessage[] = [];
-          if (item.user_message)
-            msgs.push({
-              text: item.user_message,
-              from: "user",
-              createdAt: item.createdAt,
-            });
-          if (item.bot_message)
-            msgs.push({
-              text: item.bot_message,
-              from: "bot",
-              createdAt: item.createdAt,
-            });
-          return msgs;
-        });
+      const res = await api.get(`/chat/history/${activeSessionId}`);
+      if (!Array.isArray(res.data)) return;
 
-        setMessages(history);
+      const history: ChatMessage[] = res.data.flatMap((item: any) => {
+        const msgs: ChatMessage[] = [];
+        if (item.user_message)
+          msgs.push({
+            text: item.user_message,
+            from: "user",
+            createdAt: item.createdAt,
+          });
+        if (item.bot_message)
+          msgs.push({
+            text: item.bot_message,
+            from: "bot",
+            createdAt: item.createdAt,
+          });
+        return msgs;
+      });
 
-        // Auto rename session title based on first user message
-        if (history.length && history[0].from === "user") {
-          setSessions((prev) =>
-            prev.map((s) =>
-              s.id === activeSessionId
-                ? { ...s, title: history[0].text }
-                : s
-            )
-          );
-        }
-      } catch (err) {
-        console.error("Failed to fetch chat", err);
-      }
+      setMessages(history);
     };
 
     fetchChat();
   }, [activeSessionId]);
 
-  /* ================= NEW CHAT SESSION ================= */
+  /* ================= NEW SESSION ================= */
   const createNewSession = async () => {
-    try {
-      const res = await api.post("/chat/createSession", null, {
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("access_token")}`,
-        },
-      });
+    const res = await api.post("/chat/createSession", null, {
+      headers: { Authorization: `Bearer ${localStorage.getItem("access_token")}` },
+    });
 
-      setSessions((prev) => [res.data, ...prev]);
-      setActiveSessionId(res.data.id);
-      setMessages([]);
-    } catch (err) {
-      console.error("Failed to create session", err);
-    }
+    // Set and persist the new session as active
+    setActiveSessionId(res.data._id);
+    localStorage.setItem("activeSessionId", res.data._id);  // Persist active session in localStorage
+    setMessages([]); // Clear messages
+
+    // Auto refresh after creating a new session
+    window.location.reload();
   };
 
   /* ================= DELETE SESSION ================= */
   const deleteSession = async (sessionId: string) => {
-    if (!window.confirm("Are you sure you want to delete this chat session?")) return;
+    const confirmDelete = window.confirm("Are you sure you want to delete this session?");
+    if (!confirmDelete) return;
 
     try {
       await api.delete(`/chat/history/${sessionId}`, {
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("access_token")}`,
-        },
+        headers: { Authorization: `Bearer ${localStorage.getItem("access_token")}` },
       });
 
-      setSessions((prev) => prev.filter((s) => s !== sessionId));
+      // Update state without refreshing the page
+      setSessions((prevSessions) => prevSessions.filter((session) => session._id !== sessionId));
 
       if (activeSessionId === sessionId) {
-        const remainingSessions = sessions.filter((s) => s !== sessionId);
-        if (remainingSessions.length > 0) {
-          setActiveSessionId(remainingSessions[0]);
-        } else {
-          setActiveSessionId(null);
-          setMessages([]);
-        }
+        setActiveSessionId(null);
+        setMessages([]);
+        localStorage.removeItem("activeSessionId"); // Clear the active session from localStorage
       }
     } catch (err) {
-      console.error("Failed to delete session", err);
+      console.error("Error deleting session:", err);
     }
   };
 
@@ -192,54 +163,19 @@ const Chat: React.FC = () => {
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
 
-    // Add typing indicator
-    setMessages((prev) => [
-      ...prev,
-      { text: "Typing...", from: "bot", isTyping: true },
-    ]);
+    setMessages((prev) => [...prev, { text: "Typing...", from: "bot", isTyping: true }]);
 
-    try {
-      const res = await api.post("/chat", {
-        message: input,
-        id: activeSessionId,
-      });
+    await api.post("/chat", {
+      message: input,
+      id: activeSessionId,
+    });
 
-      setMessages((prev) => [
-        ...prev.filter((m) => !m.isTyping),
-        {
-          text: res.data.reply,
-          from: "bot",
-          createdAt: new Date().toISOString(),
-        },
-      ]);
-    } catch {
-      setMessages((prev) => [
-        ...prev.filter((m) => !m.isTyping),
-        {
-          text: "Error sending message",
-          from: "bot",
-          createdAt: new Date().toISOString(),
-        },
-      ]);
-    }
+    // Refresh after sending the message
+    window.location.reload();
   };
 
-  /* ================= UTILS ================= */
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") sendMessage();
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("refresh_token");
-    setAuthToken(null);
-    navigate("/");
-  };
-
-  /* ================= RENDER ================= */
   return (
     <div style={styles.layout}>
-      {/* ===== SIDEBAR ===== */}
       <aside style={styles.sidebar}>
         <button style={styles.newChatBtn} onClick={createNewSession}>
           <FiPlus size={16} /> New chat
@@ -248,10 +184,10 @@ const Chat: React.FC = () => {
         <div style={styles.sessionList}>
           {sessions.map((s) => (
             <div
-              key={s}
+              key={s._id}
               style={{
                 ...styles.sessionItem,
-                background: s === activeSessionId ? "#343541" : "transparent",
+                background: s._id === activeSessionId ? "#343541" : "transparent",
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
@@ -260,19 +196,14 @@ const Chat: React.FC = () => {
               <span
                 style={{ cursor: "pointer", flex: 1 }}
                 onClick={() => {
-                  if (s !== activeSessionId) {
-                    setMessages([]);
-                    setActiveSessionId(s);
-                  }
+                  setActiveSessionId(s._id);
+                  localStorage.setItem("activeSessionId", s._id);  // Persist active session
                 }}
               >
-                {s.title || "New chat"}
+                {s.chat_history?.[0]?.user_message || "New chat"}
               </span>
 
-              <button
-                onClick={() => deleteSession(s)}
-                style={styles.deleteButton}
-              >
+              <button onClick={() => deleteSession(s._id)} style={styles.deleteButton}>
                 <FiTrash2 />
               </button>
             </div>
@@ -280,11 +211,19 @@ const Chat: React.FC = () => {
         </div>
       </aside>
 
-      {/* ===== CHAT AREA ===== */}
       <main style={styles.container}>
         <header style={styles.header}>
           <h3>Chat</h3>
-          <button style={styles.logout} onClick={handleLogout}>
+          <button
+            style={styles.logout}
+            onClick={() => {
+              localStorage.removeItem("access_token");
+              localStorage.removeItem("refresh_token");
+              localStorage.removeItem("activeSessionId"); // Clear the active session on logout
+              setAuthToken(null);
+              navigate("/");
+            }}
+          >
             Logout
           </button>
         </header>
@@ -304,18 +243,8 @@ const Chat: React.FC = () => {
             >
               <div>{msg.text}</div>
               {msg.createdAt && (
-                <div
-                  style={{
-                    fontSize: "10px",
-                    marginTop: "2px",
-                    textAlign: "right",
-                    opacity: 0.6,
-                  }}
-                >
-                  {new Date(msg.createdAt).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                <div style={{ fontSize: "10px", marginTop: "2px", textAlign: "right", opacity: 0.6 }}>
+                  {new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                 </div>
               )}
             </div>
@@ -327,7 +256,7 @@ const Chat: React.FC = () => {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
+            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
             placeholder="Send a message..."
             style={styles.input}
           />
@@ -340,7 +269,7 @@ const Chat: React.FC = () => {
   );
 };
 
-/* ================= STYLES ================= */
+export default Chat;
 
 const styles: { [key: string]: React.CSSProperties } = {
   layout: {
@@ -367,39 +296,28 @@ const styles: { [key: string]: React.CSSProperties } = {
     gap: "10px",
     padding: "12px",
     borderRadius: "12px",
-    border: "none",
-    background: "linear-gradient(90deg, #6c5ce7, #a29bfe)",
+    backgroundColor: "#4f46e5",
     color: "#fff",
     fontWeight: 500,
     cursor: "pointer",
     marginBottom: "15px",
-    transition: "transform 0.2s",
   },
   sessionList: {
     overflowY: "auto",
     flex: 1,
-    marginTop: "10px",
   },
   sessionItem: {
     padding: "12px 15px",
     borderRadius: "10px",
     cursor: "pointer",
     fontSize: "14px",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
     marginBottom: "8px",
-    transition: "all 0.2s",
   },
   deleteButton: {
     background: "transparent",
     border: "none",
     color: "#ff6b6b",
     cursor: "pointer",
-    fontWeight: "bold",
-    marginLeft: "8px",
-    display: "flex",
-    alignItems: "center",
   },
 
   /* ===== CHAT AREA ===== */
@@ -417,18 +335,14 @@ const styles: { [key: string]: React.CSSProperties } = {
     justifyContent: "space-between",
     alignItems: "center",
     fontWeight: 600,
-    fontSize: "18px",
-    boxShadow: "0 2px 4px rgba(0,0,0,0.05)",
   },
   logout: {
-    border: "none",
     background: "#ef4444",
-    color: "#fff",
     padding: "8px 16px",
     borderRadius: "8px",
+    color: "#fff",
+    border: "none",
     cursor: "pointer",
-    fontWeight: 500,
-    transition: "background 0.2s",
   },
   chatBox: {
     flex: 1,
@@ -437,14 +351,12 @@ const styles: { [key: string]: React.CSSProperties } = {
     flexDirection: "column",
     gap: "12px",
     overflowY: "auto",
-    background: "#e8e8f0",
   },
   message: {
     padding: "12px 18px",
     borderRadius: "20px",
     maxWidth: "70%",
     wordWrap: "break-word",
-    boxShadow: "0 2px 6px rgba(0,0,0,0.1)",
   },
   inputContainer: {
     display: "flex",
@@ -459,21 +371,14 @@ const styles: { [key: string]: React.CSSProperties } = {
     border: "1px solid #ccc",
     outline: "none",
     fontSize: "14px",
-    transition: "border-color 0.2s",
   },
   sendButton: {
     marginLeft: "12px",
     padding: "14px",
     borderRadius: "50%",
-    border: "none",
-    background: "linear-gradient(135deg, #6c5ce7, #a29bfe)",
+    background: "#4f46e5",
     color: "#fff",
     cursor: "pointer",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    transition: "transform 0.2s",
   },
 };
 
-export default Chat;
